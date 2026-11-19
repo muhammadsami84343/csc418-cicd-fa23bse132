@@ -1,4 +1,4 @@
-FROM nginx:alpinee
+FROM nginx:alpine
 # APP_VERSION is passed in by the pipeline (the Git commit ID)
 ARG APP_VERSION=dev
 ENV APP_VERSION=$APP_VERSION
