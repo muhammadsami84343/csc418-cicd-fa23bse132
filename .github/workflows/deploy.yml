@@ -1,0 +1,104 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: csc418-multi
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Use the short commit ID as the image tag
+        id: vars
+        run: echo "tag=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Full image name
+        id: img
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: echo "name=$REGISTRY/$ECR_REPO" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU (lets the x86 runner build ARM images)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build for amd64 and arm64 and push to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: APP_VERSION=${{ steps.vars.outputs.tag }}
+          tags: |
+            ${{ steps.img.outputs.name }}:${{ steps.vars.outputs.tag }}
+            ${{ steps.img.outputs.name }}:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to every instance tagged Lab=csc418-57
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REG=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+          IMG=$REG/$ECR_REPO:${{ needs.build.outputs.tag }}
+          cat > cmd.json <<EOF
+          {"commands":[
+            "export AWS_DEFAULT_REGION=$AWS_REGION",
+            "aws ecr get-login-password | docker login -u AWS --password-stdin $REG",
+            "docker pull $IMG",
+            "docker rm -f web || true",
+            "docker run -d --name web --restart always -p 80:80 $IMG",
+            "docker ps --filter name=web"
+          ]}
+          EOF
+          CMD_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets Key=tag:Lab,Values=csc418-57 \
+            --comment "Deploy $IMG" \
+            --parameters file://cmd.json \
+            --query Command.CommandId --output text)
+          echo "SSM command ID: $CMD_ID"
+          for i in $(seq 1 18); do
+            sleep 10
+            S=$(aws ssm list-command-invocations --command-id $CMD_ID \
+                --query "CommandInvocations[].Status" --output text)
+            echo "Status: $S"
+            if [ -n "$S" ] && ! echo "$S" | grep -qE "Pending|InProgress"; then
+              break
+            fi
+          done
+          aws ssm list-command-invocations --command-id $CMD_ID \
+            --query "CommandInvocations[].[InstanceId,Status]" --output table
+          if echo "$S" | grep -qE "Failed|TimedOut|Cancelled"; then exit 1; fi
